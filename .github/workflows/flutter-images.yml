@@ -1,0 +1,126 @@
+# .github/workflows/flutter-images.yml
+# Detects new Flutter stable/beta releases, records them in versions.json,
+# and builds + pushes multi-arch images to ghcr.io/<owner>/flutter.
+name: Flutter images
+
+on:
+  schedule:
+    # Every 2 hours
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if the version tag already exists
+        type: boolean
+        default: false
+  push:
+    branches: [master]
+    paths:
+      - sdk/**
+      - .github/workflows/flutter-images.yml
+
+concurrency:
+  group: flutter-images
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/flutter   # owner must be lowercase
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve latest Flutter versions
+        run: |
+          set -euo pipefail
+          json=$(curl -fsSL https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json)
+          ver() {
+            jq -r --arg c "$1" '.current_release[$c] as $h
+              | first(.releases[] | select(.hash == $h and .channel == $c)).version' <<<"$json"
+          }
+          stable=$(ver stable); beta=$(ver beta)
+          for v in "$stable" "$beta"; do
+            [[ -n "$v" && "$v" != null ]] || { echo "::error::Could not resolve versions"; exit 1; }
+          done
+          jq -n --arg s "$stable" --arg b "$beta" '{stable: $s, beta: $b}' > versions.json
+          echo "stable=$stable beta=$beta"
+
+      - name: Commit version bump
+        run: |
+          git add versions.json
+          if git diff --cached --quiet; then echo "No change"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: Update Flutter (stable $(jq -r .stable versions.json), beta $(jq -r .beta versions.json))"
+          git push
+
+      - name: Build matrix
+        id: matrix
+        run: |
+          # stable -> stable,latest ; beta -> beta ; merged when both point at the same version
+          m=$(jq -c '[{v: .stable, t: ["stable","latest"]}, {v: .beta, t: ["beta"]}]
+                     | group_by(.v) | map({version: .[0].v, tags: (map(.t[]) | join(","))})' versions.json)
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    env:
+      VERSION: ${{ matrix.version }}
+      CHANNEL_TAGS: ${{ matrix.tags }}
+      FORCE: ${{ github.event_name == 'push' || inputs.force == true }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide tags / skip if already published
+        id: meta
+        run: |
+          vtag="${VERSION//+/-}"
+          if [[ "$FORCE" != true ]] && docker buildx imagetools inspect "$IMAGE:$vtag" >/dev/null 2>&1; then
+            echo "$IMAGE:$vtag exists; just pointing channel tags at it"
+            for t in ${CHANNEL_TAGS//,/ }; do
+              docker buildx imagetools create -t "$IMAGE:$t" "$IMAGE:$vtag"
+            done
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo "tags<<EOF"
+            echo "$IMAGE:$vtag"
+            for t in ${CHANNEL_TAGS//,/ }; do echo "$IMAGE:$t"; done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+        if: steps.meta.outputs.skip != 'true'
+
+      - uses: docker/build-push-action@v6
+        if: steps.meta.outputs.skip != 'true'
+        with:
+          context: sdk
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: flutter_version=${{ matrix.version }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
